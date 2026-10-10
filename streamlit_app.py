@@ -80,19 +80,66 @@ WIFI WIKA WINR WINS WIRG WMPP WMUU WTON YPAS ZATA ZBRA ZINC ZONE
 FALLBACK_CODES = list(dict.fromkeys(FALLBACK_CODES))
 
 
+class ArjumRateLimitError(RuntimeError):
+    """Raised when Arjum keeps rate-limiting after bounded retries."""
+
+
 def api_get(path: str, params: dict | None = None):
+    """GET Arjum API with bounded retries and Retry-After support.
+
+    Never retries authentication errors. For HTTP 429 and transient 5xx/network
+    errors, retries are bounded to avoid hammering the provider.
+    """
     if not API_KEY:
         raise RuntimeError("API key belum diatur. Tambahkan ARJUM_API_KEY di Streamlit Secrets.")
-    response = requests.get(
-        f"{ARJUM_BASE_URL}{path}",
-        headers={"X-API-Key": API_KEY, "Accept": "application/json"},
-        params=params or {},
-        timeout=REQUEST_TIMEOUT,
-    )
-    if response.status_code in (401, 403):
-        raise RuntimeError("Arjum menolak API key (401/403). Periksa key dan hak akses.")
-    response.raise_for_status()
-    return response.json()
+
+    max_retries = max(0, min(int(os.getenv("ARJUM_MAX_RETRIES", "2")), 4))
+    url = f"{ARJUM_BASE_URL}{path}"
+    headers = {"X-API-Key": API_KEY, "Accept": "application/json"}
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = requests.get(
+                url, headers=headers, params=params or {}, timeout=REQUEST_TIMEOUT
+            )
+        except requests.RequestException as exc:
+            if attempt >= max_retries:
+                raise RuntimeError(f"Gangguan koneksi setelah {attempt + 1} percobaan: {exc.__class__.__name__}") from exc
+            time.sleep(min(2 ** attempt, 8))
+            continue
+
+        if response.status_code in (401, 403):
+            raise RuntimeError(f"Arjum menolak akses (HTTP {response.status_code}); periksa API key dan hak akses.")
+
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After", "").strip()
+            try:
+                wait_seconds = float(retry_after)
+            except (TypeError, ValueError):
+                wait_seconds = min(2 ** (attempt + 1), 30)
+            # Cap each wait to avoid a malformed header causing an endless wait.
+            wait_seconds = max(1.0, min(wait_seconds, 60.0))
+            if attempt >= max_retries:
+                raise ArjumRateLimitError(
+                    f"HTTP 429: batas permintaan Arjum tercapai setelah {attempt + 1} percobaan. "
+                    f"Tunggu lalu jalankan scan lagi (server meminta jeda sekitar {wait_seconds:.0f} detik)."
+                )
+            time.sleep(wait_seconds)
+            continue
+
+        if response.status_code in (500, 502, 503, 504):
+            if attempt >= max_retries:
+                response.raise_for_status()
+            time.sleep(min(2 ** (attempt + 1), 8))
+            continue
+
+        response.raise_for_status()
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise RuntimeError("Respons Arjum bukan JSON yang valid.") from exc
+
+    raise RuntimeError("Permintaan API gagal setelah percobaan ulang.")
 
 
 def extract_rows(payload):
@@ -438,21 +485,35 @@ if start_scan:
             status_box = st.empty()
             total = len(target_codes)
 
-            # Requests are sequential and rate-limited to avoid bursts.
+            # Conservative pacing between symbols. Actual safe rate depends on
+            # the provider/account quota; retries above honor Retry-After.
+            request_pause = max(0.25, min(float(os.getenv("ARJUM_REQUEST_PAUSE", "0.6")), 5.0))
+            processed = 0
+            rate_limited = False
             for index, code in enumerate(target_codes, start=1):
                 try:
                     result = analyze_one(code, timeframe, int(horizon))
                     results.append(result)
+                except ArjumRateLimitError as exc:
+                    errors.append({"code": code, "error": str(exc)[:220]})
+                    processed = index
+                    rate_limited = True
+                    progress.progress(index / total, text=f"Dihentikan karena batas API pada {code}")
+                    status_box.warning(
+                        "Scan dihentikan sementara karena Arjum mengembalikan HTTP 429 berulang. "
+                        "Ini bukan kegagalan filter skor. Tunggu sesuai batas provider sebelum scan ulang."
+                    )
+                    break
                 except Exception as exc:
-                    errors.append({"code": code, "error": str(exc)[:180]})
+                    errors.append({"code": code, "error": str(exc)[:220]})
 
+                processed = index
                 progress.progress(index / total, text=f"Memproses {index}/{total}: {code}")
                 if index % 10 == 0 or index == total:
                     status_box.info(
                         f"Progres {index}/{total} · berhasil {len(results)} · gagal {len(errors)}"
                     )
-                # A small pause helps avoid bursty requests; API quota is provider-controlled.
-                time.sleep(0.08)
+                time.sleep(request_pause)
 
             results.sort(key=lambda item: (item["score"], item["gpr_return_pct"]), reverse=True)
             st.session_state.scan_results = results
@@ -461,15 +522,24 @@ if start_scan:
                 "timeframe": timeframe,
                 "horizon": int(horizon),
                 "requested": total,
+                "processed": processed,
                 "success": len(results),
                 "errors": len(errors),
+                "not_processed": max(0, total - processed),
+                "stopped_for_rate_limit": rate_limited,
                 "source": universe_source,
                 "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
             }
             progress.progress(1.0, text="Pemindaian selesai.")
-            status_box.success(
-                f"Selesai: {len(results)} berhasil dianalisis dari {total} kode; {len(errors)} gagal."
-            )
+            if not rate_limited:
+                status_box.success(
+                    f"Selesai: {len(results)} berhasil dianalisis dari {total} kode; {len(errors)} gagal."
+                )
+            else:
+                st.warning(
+                    f"Hasil parsial: {len(results)} berhasil dianalisis, {len(errors)} error tercatat, "
+                    f"dan {max(0, total - processed)} kode belum diproses karena rate limit."
+                )
 
 results = st.session_state.scan_results
 errors = st.session_state.scan_errors
@@ -568,4 +638,21 @@ with tab_status:
     )
     if errors:
         st.subheader(f"Kode gagal ({len(errors)})")
-        st.dataframe(pd.DataFrame(errors), use_container_width=True, hide_index=True)
+        error_df = pd.DataFrame(errors)
+        if "error" in error_df.columns:
+            error_df["jenis_error"] = error_df["error"].apply(
+                lambda message: (
+                    "Rate limit (429)" if "429" in str(message) or "Too Many Requests" in str(message)
+                    else "Data candle kosong/format" if "candle kosong" in str(message).lower() or "format respons" in str(message).lower()
+                    else "Data candle kurang" if "perlu minimal" in str(message).lower()
+                    else "Koneksi/timeout" if "timeout" in str(message).lower() or "koneksi" in str(message).lower()
+                    else "Error lainnya"
+                )
+            )
+            st.caption("Ringkasan jenis error")
+            st.dataframe(
+                error_df["jenis_error"].value_counts().rename_axis("Jenis error").reset_index(name="Jumlah"),
+                use_container_width=True,
+                hide_index=True,
+            )
+        st.dataframe(error_df, use_container_width=True, hide_index=True)
