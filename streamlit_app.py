@@ -318,6 +318,10 @@ def gpr_project(df, horizon=10, training=30, momentum_len=5, vol_len=14,
     vol_prev = float(volatility[idx])
     cumulative_return = 0.0
     predictions = []
+    # Approximate GPR posterior uncertainty for each predicted log-return.
+    # The cumulative value assumes forecast errors are independent across steps;
+    # it is a model-uncertainty estimate, NOT a probability of loss or success.
+    cumulative_variance = 0.0
 
     for h in range(horizon):
         fade = volume_fade ** h
@@ -331,6 +335,12 @@ def gpr_project(df, horizon=10, training=30, momentum_len=5, vol_len=14,
         ])
         kstar = np.array([matern32_kernel(X[i], x_star, signal_var, kernel_scale) for i in range(n)])
         pred_ret = float(kstar @ alpha)
+        try:
+            solved = np.linalg.solve(L, kstar)
+            predictive_variance = max(float(signal_var - solved @ solved), 0.0)
+        except (np.linalg.LinAlgError, ValueError):
+            predictive_variance = 0.0
+        cumulative_variance += predictive_variance
         cumulative_return += pred_ret
         price_pred = price_start * math.exp(cumulative_return)
         distance = atr_width * float(atr[idx]) * math.sqrt(h + 1.0)
@@ -364,6 +374,7 @@ def gpr_project(df, horizon=10, training=30, momentum_len=5, vol_len=14,
         "momentum": "POSITIVE" if mom_now > 0 else "NEGATIVE",
         "relative_volume": round(rel_vol, 2),
         "gpr_return_pct": final["return_pct"],
+        "uncertainty_pct": round(math.sqrt(max(cumulative_variance, 0.0)) * 100.0, 2),
         "projected_price": final["price"],
         "upper": final["upper"],
         "lower": final["lower"],
@@ -579,12 +590,18 @@ with tab_rank:
                 "Kategori": category,
                 "Skor": score,
                 "GPR Return": item["gpr_return_pct"],
+                "Uncertainty (%)": item.get("uncertainty_pct", np.nan),
                 "Tren": item["trend"],
                 "Momentum": item["momentum"],
                 "Rel. Volume": item["relative_volume"],
                 "Sinyal": item["signal"],
                 "Harga": item["price"],
             })
+        st.caption(
+            "Uncertainty (%) = perkiraan ketidakpastian prediksi GPR kumulatif untuk horizon terpilih. "
+            "Ini bukan probabilitas harga turun/naik dan bukan jaminan hasil. Nilai lebih rendah "
+            "berarti model lebih yakin secara relatif, bukan berarti prediksi pasti benar."
+        )
         st.dataframe(pd.DataFrame(view_rows), use_container_width=True, hide_index=True)
         st.download_button(
             "⬇️ Unduh ranking CSV",
@@ -613,6 +630,7 @@ with tab_analysis:
             b.metric("Tren", item["trend"])
             c.metric("Momentum", item["momentum"])
             d.metric("GPR Return", f"{item['gpr_return_pct']:+.2f}%")
+            st.metric("GPR Uncertainty (perkiraan)", f"{item.get('uncertainty_pct', float('nan')):.2f}%")
             preds = item.get("predictions", [])
             if preds:
                 chart_df = pd.DataFrame({
